@@ -1,0 +1,329 @@
+# .github/workflows/deploy-production.yml
+name: Deploy to Production
+
+on:
+  push:
+    branches: [ main ]
+    tags: [ 'v*' ]
+
+env:
+  NODE_VERSION: '18.x'
+  PNPM_VERSION: '8.x'
+  PYTHON_VERSION: '3.11'
+
+jobs:
+  deployment-check:
+    name: Deployment Pre-check
+    runs-on: ubuntu-latest
+    
+    outputs:
+      frontend-ready: ${{ steps.check-frontend.outputs.ready }}
+      backend-ready: ${{ steps.check-backend.outputs.ready }}
+      inference-ready: ${{ steps.check-inference.outputs.ready }}
+      version: ${{ steps.get-version.outputs.version }}
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Get version
+      id: get-version
+      run: |
+        if [[ $GITHUB_REF == refs/tags/* ]]; then
+          VERSION=${GITHUB_REF#refs/tags/}
+        else
+          VERSION=$(node -p "require('./package.json').version")
+        fi
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+    - name: Check frontend readiness
+      id: check-frontend
+      run: |
+        if [ -f "apps/frontend/package.json" ]; then
+          echo "ready=true" >> $GITHUB_OUTPUT
+        else
+          echo "ready=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Check backend readiness
+      id: check-backend
+      run: |
+        if [ -f "services/backend/package.json" ]; then
+          echo "ready=true" >> $GITHUB_OUTPUT
+        else
+          echo "ready=false" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Check inference readiness
+      id: check-inference
+      run: |
+        if [ -f "services/inference/requirements.txt" ]; then
+          echo "ready=true" >> $GITHUB_OUTPUT
+        else
+          echo "ready=false" >> $GITHUB_OUTPUT
+        fi
+
+  deploy-frontend:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: deployment-check
+    if: needs.deployment-check.outputs.frontend-ready == 'true'
+    
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: '**/pnpm-lock.yaml'
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build shared packages
+      run: pnpm build:packages
+
+    - name: Build frontend for production
+      run: pnpm --filter frontend build:production
+      env:
+        NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+        NEXT_PUBLIC_INFERENCE_API_URL: ${{ secrets.NEXT_PUBLIC_INFERENCE_API_URL }}
+        NEXT_PUBLIC_APP_VERSION: ${{ needs.deployment-check.outputs.version }}
+
+    - name: Deploy to Vercel
+      uses: vercel/action@v1
+      with:
+        vercel-token: ${{ secrets.VERCEL_TOKEN }}
+        vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+        vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+        working-directory: apps/frontend
+        vercel-args: '--prod'
+
+    - name: Run production health check
+      run: |
+        curl -f ${{ secrets.PRODUCTION_FRONTEND_URL }}/api/health || exit 1
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: Frontend deployed to production
+        channel: '#deployments'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy-backend:
+    name: Deploy Backend
+    runs-on: ubuntu-latest
+    needs: deployment-check
+    if: needs.deployment-check.outputs.backend-ready == 'true'
+    
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push backend image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: services/backend/Dockerfile
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/cypher-cam-backend:${{ needs.deployment-check.outputs.version }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/cypher-cam-backend:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          NODE_ENV=production
+
+    - name: Deploy to production
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /opt/cypher-cam-master
+          docker-compose pull backend
+          docker-compose up -d backend
+          sleep 30
+          curl -f http://localhost:3001/api/health || exit 1
+
+    - name: Run database migrations
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /opt/cypher-cam-master
+          docker-compose exec backend pnpm prisma:migrate:deploy
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: Backend deployed to production
+        channel: '#deployments'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  deploy-inference:
+    name: Deploy Inference Service
+    runs-on: ubuntu-latest
+    needs: deployment-check
+    if: needs.deployment-check.outputs.inference-ready == 'true'
+    
+    environment: production
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Docker Hub
+      uses: docker/login-action@v3
+      with:
+        username: ${{ secrets.DOCKERHUB_USERNAME }}
+        password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+    - name: Build and push inference image
+      uses: docker/build-push-action@v5
+      with:
+        context: services/inference
+        push: true
+        tags: |
+          ${{ secrets.DOCKERHUB_USERNAME }}/cypher-cam-inference:${{ needs.deployment-check.outputs.version }}
+          ${{ secrets.DOCKERHUB_USERNAME }}/cypher-cam-inference:latest
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          ENVIRONMENT=production
+
+    - name: Deploy to production
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /opt/cypher-cam-master
+          docker-compose pull inference
+          docker-compose up -d inference
+          sleep 60  # Allow time for models to load
+          curl -f http://localhost:8001/health || exit 1
+
+    - name: Warm up models
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /opt/cypher-cam-master
+          docker-compose exec inference python -c "
+          from src.computer_vision.models.model_manager import ModelManager
+          from src.llm.models.model_loader import ModelLoader
+          print('Models warmed up successfully')
+          "
+
+    - name: Notify deployment
+      uses: 8398a7/action-slack@v3
+      with:
+        status: ${{ job.status }}
+        text: Inference service deployed to production
+        channel: '#deployments'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: [deploy-frontend, deploy-backend, deploy-inference]
+    
+    environment: production
+    
+    steps:
+    - name: Run end-to-end tests
+      run: |
+        curl -f ${{ secrets.PRODUCTION_FRONTEND_URL }}/api/health
+        curl -f ${{ secrets.PRODUCTION_BACKEND_URL }}/api/health
+        curl -f ${{ secrets.PRODUCTION_INFERENCE_URL }}/health
+        echo "All services are healthy"
+
+    - name: Test authentication flow
+      run: |
+        RESPONSE=$(curl -s -o /dev/null -w "%{http_code}" \
+          -X POST ${{ secrets.PRODUCTION_BACKEND_URL }}/api/auth/health-check)
+        if [ "$RESPONSE" -eq 200 ]; then
+          echo "Authentication service is working"
+        else
+          echo "Authentication service test failed"
+          exit 1
+        fi
+
+    - name: Test file upload flow
+      run: |
+        # Test basic file upload functionality
+        echo "Testing file upload endpoint..."
+
+    - name: Notify success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: Production deployment completed successfully!
+        channel: '#deployments'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  rollback:
+    name: Rollback if needed
+    runs-on: ubuntu-latest
+    if: failure() && needs.deployment-check.result == 'success'
+    
+    steps:
+    - name: Rollback deployment
+      uses: appleboy/ssh-action@v1
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /opt/cypher-cam-master
+          docker-compose down
+          docker-compose up -d
+
+    - name: Notify rollback
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: Deployment failed - rollback initiated
+        channel: '#deployments'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}

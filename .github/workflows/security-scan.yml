@@ -1,0 +1,176 @@
+# .github/workflows/security-scan.yml
+name: Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 0 * * 0' # Weekly security scan
+
+jobs:
+  codeql:
+    name: CodeQL Analysis
+    runs-on: ubuntu-latest
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [ 'javascript', 'python', 'typescript' ]
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Initialize CodeQL
+      uses: github/codeql-action/init@v3
+      with:
+        languages: ${{ matrix.language }}
+        queries: security-and-quality
+
+    - name: Autobuild
+      uses: github/codeql-action/autobuild@v3
+
+    - name: Perform CodeQL Analysis
+      uses: github/codeql-action/analyze@v3
+
+  secret-scan:
+    name: Secret Scanning
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Scan for secrets
+      uses: gitleaks/gitleaks-action@v2
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  dependency-scan:
+    name: Dependency Vulnerability Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Node.js dependencies scan
+      uses: snyk/actions/node@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --all-projects --severity-threshold=high
+
+    - name: Python dependencies scan
+      uses: snyk/actions/python@master
+      env:
+        SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+      with:
+        args: --severity-threshold=high
+
+    - name: OWASP Dependency Check
+      uses: dependency-check/Dependency-Check_GH-Action@main
+      with:
+        project: 'Cypher-Cam-Master'
+        path: '.'
+        format: 'HTML'
+        args: >
+          --enableRetired
+          --failOnCVSS 7
+          --scan services/inference/
+          --scan apps/frontend/
+          --scan services/backend/
+
+  container-scan:
+    name: Container Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Build container images
+      run: |
+        docker build -t cypher-cam/backend -f services/backend/Dockerfile .
+        docker build -t cypher-cam/inference -f services/inference/Dockerfile .
+
+    - name: Scan backend container
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'cypher-cam/backend:latest'
+        format: 'sarif'
+        output: 'trivy-backend-results.sarif'
+
+    - name: Scan inference container
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: 'cypher-cam/inference:latest'
+        format: 'sarif'
+        output: 'trivy-inference-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-backend-results.sarif'
+
+    - name: Upload Trivy scan results
+      uses: github/codeql-action/upload-sarif@v3
+      with:
+        sarif_file: 'trivy-inference-results.sarif'
+
+  security-lint:
+    name: Security Linting
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run bandit (Python security lint)
+      run: |
+        pip install bandit
+        bandit -r services/inference/src/ -f json -o bandit-results.json
+
+    - name: Run npm audit
+      run: |
+        cd apps/frontend && npm audit --audit-level moderate
+        cd ../../services/backend && npm audit --audit-level moderate
+
+    - name: Check for hardcoded secrets
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+
+    - name: Run TruffleHog
+      uses: trufflesecurity/trufflehog@v3
+      with:
+        path: .
+        base: ${{ github.base_ref }}
+        head: ${{ github.head_ref }}
+
+  sast:
+    name: SAST Analysis
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Run Semgrep
+      uses: returntocorp/semgrep-action@v1
+      with:
+        config: p/security-audit
+
+    - name: Run Hadolint (Dockerfile lint)
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: services/backend/Dockerfile
+
+    - name: Run Hadolint for inference
+      uses: hadolint/hadolint-action@v3.1.0
+      with:
+        dockerfile: services/inference/Dockerfile

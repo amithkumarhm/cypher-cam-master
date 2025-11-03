@@ -1,0 +1,155 @@
+# .github/workflows/ci-frontend.yml
+name: Frontend CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'apps/frontend/**'
+      - 'packages/**'
+      - '.github/workflows/ci-frontend.yml'
+  pull_request:
+    branches: [ main, develop ]
+    paths:
+      - 'apps/frontend/**'
+      - 'packages/**'
+
+env:
+  NODE_VERSION: '18.x'
+  PNPM_VERSION: '8.x'
+
+jobs:
+  test:
+    name: Test Frontend
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: '**/pnpm-lock.yaml'
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build shared packages
+      run: pnpm build:packages
+
+    - name: Run type check
+      run: pnpm --filter frontend type-check
+
+    - name: Run linting
+      run: pnpm --filter frontend lint
+
+    - name: Run tests
+      run: pnpm --filter frontend test:ci
+
+    - name: Run unit tests
+      run: pnpm --filter frontend test:unit
+
+    - name: Build application
+      run: pnpm --filter frontend build
+      env:
+        NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+
+    - name: Upload build artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: frontend-build
+        path: apps/frontend/.next/
+        retention-days: 1
+
+  deploy:
+    name: Deploy Frontend
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'pnpm'
+        cache-dependency-path: '**/pnpm-lock.yaml'
+
+    - name: Setup pnpm
+      uses: pnpm/action-setup@v2
+      with:
+        version: ${{ env.PNPM_VERSION }}
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build shared packages
+      run: pnpm build:packages
+
+    - name: Build frontend
+      run: pnpm --filter frontend build
+      env:
+        NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+        NEXT_PUBLIC_API_URL: ${{ secrets.NEXT_PUBLIC_API_URL }}
+        NEXT_PUBLIC_INFERENCE_API_URL: ${{ secrets.NEXT_PUBLIC_INFERENCE_API_URL }}
+
+    - name: Deploy to Vercel
+      uses: vercel/action@v1
+      with:
+        vercel-token: ${{ secrets.VERCEL_TOKEN }}
+        vercel-org-id: ${{ secrets.VERCEL_ORG_ID }}
+        vercel-project-id: ${{ secrets.VERCEL_PROJECT_ID }}
+        working-directory: apps/frontend
+      env:
+        VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
+        VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
+
+    - name: Run Lighthouse CI
+      uses: treosh/lighthouse-ci-action@v11
+      with:
+        uploadArtifacts: true
+        temporaryPublicStorage: true
+        configPath: './apps/frontend/lighthouse.config.js'
+
+  pwa-audit:
+    name: PWA Audit
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+
+    - name: Install dependencies
+      run: pnpm install
+
+    - name: Build frontend
+      run: pnpm --filter frontend build
+      env:
+        NEXT_PUBLIC_SUPABASE_URL: 'https://example.supabase.co'
+        NEXT_PUBLIC_SUPABASE_ANON_KEY: 'example'
+        NEXT_PUBLIC_API_URL: 'https://api.example.com'
+
+    - name: Run PWA audit
+      run: |
+        npx pwa-audit apps/frontend/.next/
+      continue-on-error: true
